@@ -3,122 +3,16 @@ import multer from 'multer';
 import OpenAI from 'openai';
 import pg from 'pg';
 import crypto from 'crypto';
-
-const app=express();
-const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024,files:5}});
-app.use(express.json({limit:'2mb'}));
-app.use(express.static('public'));
-const ai=new OpenAI({apiKey:process.env.OPENAI_API_KEY});
-const pool=process.env.DATABASE_URL?new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}}):null;
-const ADMIN_KEY=process.env.ADMIN_KEY||'change-me';
-const q=(s,p=[])=>pool.query(s,p);
-const id=()=>crypto.randomBytes(4).toString('hex');
-function parseJSON(t){try{return JSON.parse(t.replace(/^```json\s*|```$/g,''))}catch{return null}}
-
-const NELE_CASE={
-  key:'nele-brandt',
-  title:'The Case of Nele Brandt',
-  facts:[
-    {date:'Feb–Apr 2050',text:'Each objection to the audit assistant became more costly. Brandt objected less and less.'},
-    {date:'02 May 2050',text:'She was appointed the sole responsible signatory for Frankfurt without actively consenting.'},
-    {date:'03 May 2050',text:'Her last documented objection. Her rejection of the appointment was never sent.'},
-    {date:'07–26 May 2050',text:'She opened four IT tickets to restrict or revoke her agent’s signing authority. All were automatically closed as “resolved”.'},
-    {date:'28 May 2050',text:'She was last seen in person at the IT service desk. Her employee badge remained there.'},
-    {date:'Since then',text:'Her agent has continued signing more than 1,700 audit opinions per month in her name, without the documents being opened first.'}
-  ]
-};
-
-async function init(){
-  if(!pool)return;
-  await q(`CREATE TABLE IF NOT EXISTS sessions(id text primary key,title text,question text,course_context text,created_at timestamptz default now());
-    CREATE TABLE IF NOT EXISTS submissions(id text primary key,session_id text,text_content text,artifact_name text,artifact_type text,artifact_summary text,is_meme boolean default false,created_at timestamptz default now());
-    CREATE TABLE IF NOT EXISTS analyses(session_id text primary key,data jsonb,updated_at timestamptz default now());`);
-  await q(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS activity_type text DEFAULT 'open'; ALTER TABLE sessions ADD COLUMN IF NOT EXISTS story_key text; ALTER TABLE submissions ADD COLUMN IF NOT EXISTS structured_data jsonb;`);
-}
-const auth=(req,res,next)=>req.headers['x-admin-key']===ADMIN_KEY?next():res.status(401).json({error:'Instructor key required'});
-app.get('/api/health',(r,s)=>s.json({ok:true,db:!!pool}));
-
-app.post('/api/sessions',auth,async(req,res)=>{
-  if(!pool)return res.status(500).json({error:'DATABASE_URL missing'});
-  const sid=id(), activityType=req.body.activity_type==='story'?'story':'open';
-  await q('INSERT INTO sessions(id,title,question,course_context,activity_type,story_key) VALUES($1,$2,$3,$4,$5,$6)',[sid,req.body.title||'Untitled activity',req.body.question||'',req.body.course_context||'',activityType,activityType==='story'?(req.body.story_key||'nele-brandt'):null]);
-  res.json({id:sid,activity_type:activityType});
-});
-app.get('/api/sessions/:id',async(req,res)=>{
-  const x=await q('SELECT id,title,question,activity_type,story_key FROM sessions WHERE id=$1',[req.params.id]);
-  if(!x.rows[0])return res.status(404).json({error:'Not found'});
-  const c=await q('SELECT count(*)::int n FROM submissions WHERE session_id=$1',[req.params.id]);
-  res.json({...x.rows[0],count:c.rows[0].n});
-});
-app.get('/api/admin/sessions',auth,async(req,res)=>res.json((await q('SELECT s.*,count(u.id)::int submissions FROM sessions s LEFT JOIN submissions u ON u.session_id=s.id GROUP BY s.id ORDER BY s.created_at DESC')).rows));
-
-async function summarizeFiles(files){
-  const summaries=[];
-  for(const f of files||[]){
-    let summary=`Uploaded artifact: ${f.originalname} (${f.mimetype})`;
-    try{
-      const file=await ai.files.create({file:new File([f.buffer],f.originalname,{type:f.mimetype}),purpose:'user_data'});
-      const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:[{role:'user',content:[{type:'input_text',text:'Describe this student artifact neutrally for a course reflection. Extract ideas, questions, uncertainty and surprising aspects. Do not grade it.'},{type:'input_file',file_id:file.id}]}]});
-      summary=rr.output_text;
-    }catch(e){summary+=` (automatic reading unavailable: ${e.message})`}
-    summaries.push(summary);
-  }
-  return summaries.join('\n');
-}
-
-app.post('/api/sessions/:id/submit',upload.array('files',5),async(req,res)=>{
-  const sess=(await q('SELECT * FROM sessions WHERE id=$1',[req.params.id])).rows[0];
-  if(!sess)return res.status(404).json({error:'Activity not found'});
-  const text=(req.body.text||'').trim(), artifactSummary=await summarizeFiles(req.files);
-  let structured=null;
-  if(req.body.structured_data){try{structured=JSON.parse(req.body.structured_data)}catch{return res.status(400).json({error:'Invalid structured story data'})}}
-  await q('INSERT INTO submissions(id,session_id,text_content,artifact_name,artifact_type,artifact_summary,is_meme,structured_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[id(),sess.id,text,(req.files||[]).map(f=>f.originalname).join(', '),(req.files||[]).map(f=>f.mimetype).join(', '),artifactSummary,false,structured]);
-  res.json({ok:true});
-});
-
-// Direct JSON endpoint for story HTML forms such as Vermisstenanzeige_v1.html.
-app.post('/api/sessions/:id/story-submit',async(req,res)=>{
-  const sess=(await q('SELECT * FROM sessions WHERE id=$1',[req.params.id])).rows[0];
-  if(!sess||sess.activity_type!=='story')return res.status(404).json({error:'Story investigation not found'});
-  await q('INSERT INTO submissions(id,session_id,text_content,structured_data) VALUES($1,$2,$3,$4)',[id(),sess.id,'',req.body||{}]);
-  res.json({ok:true});
-});
-
-function countStory(subs){
-  const rows=subs.map(x=>x.structured_data||{}), total=rows.length;
-  const yes=rows.filter(x=>String(x.continue_signing||x.zeichnung||'').toLowerCase()==='yes'||String(x.zeichnung||'').toLowerCase()==='ja').length;
-  const no=rows.filter(x=>String(x.continue_signing||x.zeichnung||'').toLowerCase()==='no'||String(x.zeichnung||'').toLowerCase()==='nein').length;
-  const autonomy={low:0,moderate:0,high:0,'very high':0};
-  rows.forEach(x=>{const a=String(x.ai_autonomy||'').toLowerCase();if(Object.hasOwn(autonomy,a))autonomy[a]++});
-  const pct=n=>total?Math.round(n/total*100):0;
-  return {total,signing:{yes,no,yes_pct:pct(yes),no_pct:pct(no)},autonomy:Object.fromEntries(Object.entries(autonomy).map(([k,v])=>[k,{count:v,pct:pct(v)}]))};
-}
-
-async function analyzeStory(sess,subs){
-  const stats=countStory(subs);
-  const payload=subs.map((x,i)=>({submission:i+1,...(x.structured_data||{}),additional_text:x.text_content||'',artifact_summary:x.artifact_summary||''}));
-  const prompt=`You are CoursePulse reading a classroom Story Investigation. Never grade, rank, identify or judge students. Describe collective patterns and interesting differences. The fixed case facts are supplied separately by the application; do not invent, correct or add story facts.\nActivity: ${sess.question}\nCourse context: ${sess.course_context||'none'}\nStudent reports: ${JSON.stringify(payload)}\nReturn ONLY JSON with this shape:\n{"room_summary":"2-3 sentences","signing":{"yes_reasons":["..."],"no_reasons":["..."],"yes_distinctive":["..."]},"world_2050":{"assumptions":[{"name":"...","signal":"..."}],"tensions":["..."]},"benefits_harms":{"benefit":[{"actor":"...","why":"..."}],"harm":[{"actor":"...","why":"..."}]},"first_questions":[{"cluster":"...","signal":"..."}],"investigation_paths":[{"question":"...","to_understand":"..."}],"surprising_readings":["..."],"discussion_prompts":["..."]}.\nUse only student responses for these qualitative sections. Keep minority interpretations visible. signal must be many/repeated/occasional/rare, never fabricated numeric counts. If unsupported use an empty array. Pay special attention to reasoning from students who allow continued signing, without treating it as correct or incorrect. Explicitly synthesize assumptions about the 2050 world, AI-agent autonomy, human oversight, responsibility and work when students mention them.`;
-  const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:prompt});
-  const qualitative=parseJSON(rr.output_text);
-  if(!qualitative)throw new Error('Model returned invalid JSON');
-  return {kind:'story',case_file:NELE_CASE,stats,...qualitative};
-}
-
-async function analyzeOpen(sess,subs){
-  const prompt=`You are CoursePulse, a collective reflection assistant. Never grade, rank, identify, or judge students. Synthesize the room. Activity: ${sess.question}\nCourse context: ${sess.course_context||'none'}\nSubmissions:\n${subs.map((x,i)=>`#${i+1}\n${x.text_content}\n${x.artifact_summary||''}`).join('\n')}\nReturn ONLY JSON with: room_summary (2-3 sentences), themes [{name,prevalence,description}], open_questions [string], tensions [{title,side_a,side_b}], unexpected [string], muddiest_points [{concept,signal}], missing_perspectives [string], discussion_prompts [string]. Prevalence is one of many,repeated,occasional.`;
-  const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:prompt});
-  const data=parseJSON(rr.output_text); if(!data)throw new Error('Model returned invalid JSON'); return {kind:'open',...data};
-}
-
-app.post('/api/admin/sessions/:id/analyze',auth,async(req,res)=>{
-  try{
-    const sess=(await q('SELECT * FROM sessions WHERE id=$1',[req.params.id])).rows[0], subs=(await q('SELECT text_content,artifact_summary,structured_data FROM submissions WHERE session_id=$1 ORDER BY created_at',[req.params.id])).rows;
-    if(!subs.length)return res.status(400).json({error:'No submissions yet'});
-    const data=sess.activity_type==='story'?await analyzeStory(sess,subs):await analyzeOpen(sess,subs);
-    await q('INSERT INTO analyses(session_id,data) VALUES($1,$2) ON CONFLICT(session_id) DO UPDATE SET data=$2,updated_at=now()',[sess.id,data]);
-    res.json(data);
-  }catch(e){res.status(500).json({error:e.message})}
-});
-app.get('/api/sessions/:id/pulse',async(req,res)=>{const a=(await q('SELECT data,updated_at FROM analyses WHERE session_id=$1',[req.params.id])).rows[0];if(!a)return res.status(404).json({error:'No pulse generated yet'});res.json(a)});
-app.post('/api/admin/sessions/:id/ask',auth,async(req,res)=>{const subs=(await q('SELECT text_content,artifact_summary,structured_data FROM submissions WHERE session_id=$1',[req.params.id])).rows;const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:`Answer ONLY from these student submissions. Be concise, aggregate, anonymous and non-evaluative. If unsupported, say so.\nSUBMISSIONS:${JSON.stringify(subs)}\nQUESTION:${req.body.question}`});res.json({answer:rr.output_text})});
-init().then(()=>app.listen(process.env.PORT||3000,()=>console.log('CoursePulse running'))).catch(e=>{console.error(e);process.exit(1)});
+const app=express();const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024,files:5}});app.use(express.json({limit:'2mb'}));app.use(express.static('public'));const ai=new OpenAI({apiKey:process.env.OPENAI_API_KEY});const pool=process.env.DATABASE_URL?new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}}):null;const ADMIN_KEY=process.env.ADMIN_KEY||'change-me';const q=(s,p=[])=>pool.query(s,p);const id=()=>crypto.randomBytes(4).toString('hex');function parseJSON(t){try{return JSON.parse(t.replace(/^```json\s*|```$/g,''))}catch{return null}}
+const NELE_CASE={key:'nele-brandt',title:'The Case of Nele Brandt',facts:[{date:'Feb–Apr 2050',text:'Each objection to the audit assistant became more costly. Brandt objected less and less.'},{date:'02 May 2050',text:'She was appointed the sole responsible signatory for Frankfurt without actively consenting.'},{date:'03 May 2050',text:'Her last documented objection. Her rejection of the appointment was never sent.'},{date:'07–26 May 2050',text:'She opened four IT tickets to restrict or revoke her agent’s signing authority. All were automatically closed as “resolved”.'},{date:'28 May 2050',text:'She was last seen in person at the IT service desk. Her employee badge remained there.'},{date:'Since then',text:'Her agent has continued signing more than 1,700 audit opinions per month in her name, without the documents being opened first.'}]};
+async function init(){if(!pool)return;await q(`CREATE TABLE IF NOT EXISTS sessions(id text primary key,title text,question text,course_context text,created_at timestamptz default now());CREATE TABLE IF NOT EXISTS submissions(id text primary key,session_id text,text_content text,artifact_name text,artifact_type text,artifact_summary text,is_meme boolean default false,created_at timestamptz default now());CREATE TABLE IF NOT EXISTS analyses(session_id text primary key,data jsonb,updated_at timestamptz default now());`);await q(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS activity_type text DEFAULT 'open'; ALTER TABLE sessions ADD COLUMN IF NOT EXISTS story_key text; ALTER TABLE submissions ADD COLUMN IF NOT EXISTS structured_data jsonb;`)}
+const auth=(req,res,next)=>req.headers['x-admin-key']===ADMIN_KEY?next():res.status(401).json({error:'Instructor key required'});app.get('/api/health',(r,s)=>s.json({ok:true,db:!!pool}));
+app.post('/api/sessions',auth,async(req,res)=>{if(!pool)return res.status(500).json({error:'DATABASE_URL missing'});const sid=id(),activityType=req.body.activity_type==='story'?'story':'open';await q('INSERT INTO sessions(id,title,question,course_context,activity_type,story_key) VALUES($1,$2,$3,$4,$5,$6)',[sid,req.body.title||'Untitled activity',req.body.question||'',req.body.course_context||'',activityType,activityType==='story'?(req.body.story_key||'nele-brandt'):null]);res.json({id:sid,activity_type:activityType})});
+app.get('/api/sessions/:id',async(req,res)=>{const x=await q('SELECT id,title,question,activity_type,story_key FROM sessions WHERE id=$1',[req.params.id]);if(!x.rows[0])return res.status(404).json({error:'Not found'});const c=await q('SELECT count(*)::int n FROM submissions WHERE session_id=$1',[req.params.id]);res.json({...x.rows[0],count:c.rows[0].n})});app.get('/api/admin/sessions',auth,async(req,res)=>res.json((await q('SELECT s.*,count(u.id)::int submissions FROM sessions s LEFT JOIN submissions u ON u.session_id=s.id GROUP BY s.id ORDER BY s.created_at DESC')).rows));
+app.delete('/api/admin/sessions/:id',auth,async(req,res)=>{const client=await pool.connect();try{await client.query('BEGIN');const found=await client.query('SELECT id FROM sessions WHERE id=$1',[req.params.id]);if(!found.rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'Activity not found'})}await client.query('DELETE FROM analyses WHERE session_id=$1',[req.params.id]);await client.query('DELETE FROM submissions WHERE session_id=$1',[req.params.id]);await client.query('DELETE FROM sessions WHERE id=$1',[req.params.id]);await client.query('COMMIT');res.json({ok:true})}catch(e){await client.query('ROLLBACK');res.status(500).json({error:e.message})}finally{client.release()}});
+async function summarizeFiles(files){const summaries=[];for(const f of files||[]){let summary=`Uploaded artifact: ${f.originalname} (${f.mimetype})`;try{const file=await ai.files.create({file:new File([f.buffer],f.originalname,{type:f.mimetype}),purpose:'user_data'});const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:[{role:'user',content:[{type:'input_text',text:'Describe this student artifact neutrally for a course reflection. Extract ideas, questions, uncertainty and surprising aspects. Do not grade it.'},{type:'input_file',file_id:file.id}]}]});summary=rr.output_text}catch(e){summary+=` (automatic reading unavailable: ${e.message})`}summaries.push(summary)}return summaries.join('\n')}
+app.post('/api/sessions/:id/submit',upload.array('files',5),async(req,res)=>{const sess=(await q('SELECT * FROM sessions WHERE id=$1',[req.params.id])).rows[0];if(!sess)return res.status(404).json({error:'Activity not found'});const text=(req.body.text||'').trim(),artifactSummary=await summarizeFiles(req.files);let structured=null;if(req.body.structured_data){try{structured=JSON.parse(req.body.structured_data)}catch{return res.status(400).json({error:'Invalid structured story data'})}}await q('INSERT INTO submissions(id,session_id,text_content,artifact_name,artifact_type,artifact_summary,is_meme,structured_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[id(),sess.id,text,(req.files||[]).map(f=>f.originalname).join(', '),(req.files||[]).map(f=>f.mimetype).join(', '),artifactSummary,false,structured]);res.json({ok:true})});app.post('/api/sessions/:id/story-submit',async(req,res)=>{const sess=(await q('SELECT * FROM sessions WHERE id=$1',[req.params.id])).rows[0];if(!sess||sess.activity_type!=='story')return res.status(404).json({error:'Story investigation not found'});await q('INSERT INTO submissions(id,session_id,text_content,structured_data) VALUES($1,$2,$3,$4)',[id(),sess.id,'',req.body||{}]);res.json({ok:true})});
+function countStory(subs){const rows=subs.map(x=>x.structured_data||{}),total=rows.length;const yes=rows.filter(x=>String(x.continue_signing||x.zeichnung||'').toLowerCase()==='yes'||String(x.zeichnung||'').toLowerCase()==='ja').length,no=rows.filter(x=>String(x.continue_signing||x.zeichnung||'').toLowerCase()==='no'||String(x.zeichnung||'').toLowerCase()==='nein').length,autonomy={low:0,moderate:0,high:0,'very high':0};rows.forEach(x=>{const a=String(x.ai_autonomy||'').toLowerCase();if(Object.hasOwn(autonomy,a))autonomy[a]++});const pct=n=>total?Math.round(n/total*100):0;return{total,signing:{yes,no,yes_pct:pct(yes),no_pct:pct(no)},autonomy:Object.fromEntries(Object.entries(autonomy).map(([k,v])=>[k,{count:v,pct:pct(v)}]))}}
+async function analyzeStory(sess,subs){const stats=countStory(subs),payload=subs.map((x,i)=>({submission:i+1,...(x.structured_data||{}),additional_text:x.text_content||'',artifact_summary:x.artifact_summary||''}));const prompt=`You are CoursePulse reading a classroom Story Investigation. Never grade, rank, identify or judge students. Describe collective patterns and interesting differences. The fixed case facts are supplied separately by the application; do not invent, correct or add story facts.\nActivity: ${sess.question}\nCourse context: ${sess.course_context||'none'}\nStudent reports: ${JSON.stringify(payload)}\nReturn ONLY JSON with this shape:\n{"room_summary":"2-3 sentences","signing":{"yes_reasons":["..."],"no_reasons":["..."],"yes_distinctive":["..."]},"world_2050":{"assumptions":[{"name":"...","signal":"..."}],"tensions":["..."]},"benefits_harms":{"benefit":[{"actor":"...","why":"..."}],"harm":[{"actor":"...","why":"..."}]},"first_questions":[{"cluster":"...","signal":"..."}],"investigation_paths":[{"question":"...","to_understand":"..."}],"surprising_readings":["..."],"discussion_prompts":["..."]}. Use only student responses. Keep minority interpretations visible. signal must be many/repeated/occasional/rare. If unsupported use an empty array. Pay special attention to reasoning from students who allow continued signing. Explicitly synthesize assumptions about the 2050 world, AI-agent autonomy, human oversight, responsibility and work.`;const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:prompt}),qualitative=parseJSON(rr.output_text);if(!qualitative)throw new Error('Model returned invalid JSON');return{kind:'story',case_file:NELE_CASE,stats,...qualitative}}
+async function analyzeOpen(sess,subs){const prompt=`You are CoursePulse, a collective reflection assistant. Never grade, rank, identify, or judge students. Synthesize the room. Activity: ${sess.question}\nCourse context: ${sess.course_context||'none'}\nSubmissions:\n${subs.map((x,i)=>`#${i+1}\n${x.text_content}\n${x.artifact_summary||''}`).join('\n')}\nReturn ONLY JSON with: room_summary (2-3 sentences), themes [{name,prevalence,description}], open_questions [string], tensions [{title,side_a,side_b}], unexpected [string], muddiest_points [{concept,signal}], missing_perspectives [string], discussion_prompts [string]. Prevalence is one of many,repeated,occasional.`;const rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:prompt}),data=parseJSON(rr.output_text);if(!data)throw new Error('Model returned invalid JSON');return{kind:'open',...data}}
+app.post('/api/admin/sessions/:id/analyze',auth,async(req,res)=>{try{const sess=(await q('SELECT * FROM sessions WHERE id=$1',[req.params.id])).rows[0],subs=(await q('SELECT text_content,artifact_summary,structured_data FROM submissions WHERE session_id=$1 ORDER BY created_at',[req.params.id])).rows;if(!subs.length)return res.status(400).json({error:'No submissions yet'});const data=sess.activity_type==='story'?await analyzeStory(sess,subs):await analyzeOpen(sess,subs);await q('INSERT INTO analyses(session_id,data) VALUES($1,$2) ON CONFLICT(session_id) DO UPDATE SET data=$2,updated_at=now()',[sess.id,data]);res.json(data)}catch(e){res.status(500).json({error:e.message})}});app.get('/api/sessions/:id/pulse',async(req,res)=>{const a=(await q('SELECT data,updated_at FROM analyses WHERE session_id=$1',[req.params.id])).rows[0];if(!a)return res.status(404).json({error:'No pulse generated yet'});res.json(a)});app.post('/api/admin/sessions/:id/ask',auth,async(req,res)=>{const subs=(await q('SELECT text_content,artifact_summary,structured_data FROM submissions WHERE session_id=$1',[req.params.id])).rows,rr=await ai.responses.create({model:process.env.OPENAI_MODEL||'gpt-5-mini',input:`Answer ONLY from these student submissions. Be concise, aggregate, anonymous and non-evaluative. If unsupported, say so.\nSUBMISSIONS:${JSON.stringify(subs)}\nQUESTION:${req.body.question}`});res.json({answer:rr.output_text})});init().then(()=>app.listen(process.env.PORT||3000,()=>console.log('CoursePulse running'))).catch(e=>{console.error(e);process.exit(1)});
