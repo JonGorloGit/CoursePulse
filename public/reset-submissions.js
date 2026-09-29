@@ -51,11 +51,19 @@
     for(const card of cards){
       const code=card.querySelector('.code')?.textContent?.trim();
       const edit=code&&document.querySelector(`#edit-${CSS.escape(code)}`);
-      if(!code||!edit||edit.querySelector('.edit-language-wrap'))continue;
-      const r=await nativeFetch('/api/sessions/'+encodeURIComponent(code));if(!r.ok)continue;const s=await r.json();
-      const wrap=document.createElement('div');wrap.className='edit-language-wrap';
-      wrap.innerHTML=`<label><b>Activity language</b></label><select id="edit-language-${code}" style="max-width:220px"><option value="en" ${s.dashboard_language==='de'?'':'selected'}>English (EN)</option><option value="de" ${s.dashboard_language==='de'?'selected':''}>Deutsch (DE)</option></select><p class="stat">Changing the language affects the next generated pulse. Refresh the pulse after saving to regenerate it in the new language.</p>`;
-      const actions=edit.querySelector('.form-actions');if(actions)edit.insertBefore(wrap,actions);
+      if(!code||!edit||edit.querySelector('.edit-language-wrap')||edit.dataset.languageLoading==='1')continue;
+      edit.dataset.languageLoading='1';
+      try{
+        const r=await nativeFetch('/api/sessions/'+encodeURIComponent(code));
+        if(!r.ok)continue;
+        const s=await r.json();
+        if(!edit.isConnected||edit.querySelector('.edit-language-wrap'))continue;
+        const wrap=document.createElement('div');wrap.className='edit-language-wrap';
+        wrap.innerHTML=`<label><b>Activity language</b></label><select id="edit-language-${code}" style="max-width:220px"><option value="en" ${s.dashboard_language==='de'?'':'selected'}>English (EN)</option><option value="de" ${s.dashboard_language==='de'?'selected':''}>Deutsch (DE)</option></select><p class="stat">Changing the language affects the next generated pulse. Refresh the pulse after saving to regenerate it in the new language.</p>`;
+        const actions=edit.querySelector('.form-actions');if(actions)edit.insertBefore(wrap,actions);
+      }finally{
+        if(edit.isConnected)edit.dataset.languageLoading='0';
+      }
     }
   }
 
@@ -78,11 +86,17 @@
   }
 
   async function enhancePulseLanguage(){
-    const pulse=document.querySelector('#pulse');if(!pulse||pulse.classList.contains('hidden')||pulse.querySelector('.activity-language-info'))return;
+    const pulse=document.querySelector('#pulse');if(!pulse||pulse.classList.contains('hidden')||pulse.querySelector('.activity-language-info')||pulse.dataset.languageLoading==='1')return;
     const analyzeBtn=[...pulse.querySelectorAll('button')].find(b=>(b.getAttribute('onclick')||'').includes('analyze('));const m=(analyzeBtn?.getAttribute('onclick')||'').match(/analyze\(['\"]([^'\"]+)/);if(!m)return;
-    const r=await nativeFetch('/api/sessions/'+encodeURIComponent(m[1]));if(!r.ok)return;const s=await r.json();
-    const box=document.createElement('div');box.className='card activity-language-info';box.innerHTML=`<div><b>Activity language · ${langLabel(s.dashboard_language)}</b><div class="stat">This language was chosen when the activity was created because CoursePulse analyzes the student inputs in that language. To change it, edit the activity and then refresh the pulse.</div></div>`;
-    const picker=pulse.querySelector('.dashboard-picker');if(picker)picker.parentNode.insertBefore(box,picker);else pulse.prepend(box);
+    pulse.dataset.languageLoading='1';
+    try{
+      const r=await nativeFetch('/api/sessions/'+encodeURIComponent(m[1]));if(!r.ok)return;const s=await r.json();
+      if(!pulse.isConnected||pulse.querySelector('.activity-language-info'))return;
+      const box=document.createElement('div');box.className='card activity-language-info';box.innerHTML=`<div><b>Activity language · ${langLabel(s.dashboard_language)}</b><div class="stat">This language was chosen when the activity was created because CoursePulse analyzes the student inputs in that language. To change it, edit the activity and then refresh the pulse.</div></div>`;
+      const picker=pulse.querySelector('.dashboard-picker');if(picker)picker.parentNode.insertBefore(box,picker);else pulse.prepend(box);
+    }finally{
+      if(pulse.isConnected)pulse.dataset.languageLoading='0';
+    }
   }
 
   let scheduled=false;
