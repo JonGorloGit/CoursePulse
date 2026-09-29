@@ -7,8 +7,6 @@
   const langLabel=l=>l==='de'?'Deutsch (DE)':'English (EN)';
   const selectedCreateLanguage=()=>document.querySelector('#activityLanguage')?.value||'en';
 
-  // Keep the existing CoursePulse code simple: enrich create/update requests with the
-  // language selected in the instructor UI. The backend uses this language before analysis.
   window.fetch=async function(input,init={}){
     const url=typeof input==='string'?input:(input?.url||'');
     const method=String(init.method||'GET').toUpperCase();
@@ -41,7 +39,6 @@
   function ensureCreateLanguage(){
     const form=document.querySelector('#newActivityForm');
     if(!form||form.querySelector('#activityLanguage'))return;
-    const context=document.querySelector('#activityContext')?.closest('label')||document.querySelector('#activityContext');
     const wrap=document.createElement('div');
     wrap.className='activity-language-create';
     wrap.innerHTML=`<label for="activityLanguage"><b>Activity language</b></label><select id="activityLanguage" style="max-width:220px"><option value="en">English (EN)</option><option value="de">Deutsch (DE)</option></select><p class="stat">Choose the language in which students are expected to respond. CoursePulse uses this setting when it analyzes the original student inputs and generates the dashboard — it does not simply translate an already generated pulse.</p>`;
@@ -63,9 +60,11 @@
   }
 
   function enhanceInstructorCredit(){
-    const teacher=document.querySelector('#teacher');if(!teacher)return;
-    let credit=teacher.querySelector('.developer-credit');
-    if(!credit){credit=document.createElement('div');credit.className='stat developer-credit';credit.style.cssText='margin:32px 0 8px;text-align:center;opacity:.72';credit.textContent='CoursePulse developed by Jon Gorlo · For questions about CoursePulse, please contact Jon Gorlo.'}
+    const teacher=document.querySelector('#teacher');if(!teacher||teacher.querySelector('.developer-credit'))return;
+    const credit=document.createElement('div');
+    credit.className='stat developer-credit';
+    credit.style.cssText='margin:32px 0 8px;text-align:center;opacity:.72';
+    credit.textContent='CoursePulse developed by Jon Gorlo · For questions about CoursePulse, please contact Jon Gorlo.';
     teacher.appendChild(credit);
   }
 
@@ -86,6 +85,9 @@
     const picker=pulse.querySelector('.dashboard-picker');if(picker)picker.parentNode.insertBefore(box,picker);else pulse.prepend(box);
   }
 
+  let scheduled=false;
   function enhance(){ensureCreateLanguage();enhanceActivityCards();enhanceInstructorCredit();ensureEditLanguages();enhancePulseLanguage()}
-  const observer=new MutationObserver(enhance);const start=()=>{observer.observe(document.body,{childList:true,subtree:true});enhance()};if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
+  const observer=new MutationObserver(()=>{if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;enhance()})});
+  const start=()=>{observer.observe(document.body,{childList:true,subtree:true});enhance()};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
 })();
